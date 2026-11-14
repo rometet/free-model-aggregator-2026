@@ -1,0 +1,12 @@
+free-model-aggregator-01-kit/
+official-kit.tar.gz
+logs/
+secrets/
+output/
+.serena/
+tests/
+*.log
+*.ndjson
+*.jsonl
+*.err
+
