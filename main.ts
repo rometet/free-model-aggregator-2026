@@ -102,6 +102,12 @@ let catalog: CatalogReport = { providers: [] };
 /** How many client API requests have arrived: the manifest is in arrival order, one request at a time. */
 let manifestIndex = 0;
 
+/** A small quality cost for reusing one provider in the offline request plan. */
+const PLAN_LOAD_PENALTY = 20;
+
+/** The planned first route for each manifest request; fallback routes are added at request time. */
+let plannedRoutes: Array<Route | null> = [];
+
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
 }
@@ -112,6 +118,7 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  planRoutes();
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -142,12 +149,7 @@ function routeKey(route: Route): string {
   return `${route.probe.provider.id}\u0000${route.model.id}`;
 }
 
-/**
- * The provider and model that serve one request. TODO(quality): rank every free candidate that meets the
- * requirements by the quality table's rating_milli (quality is 60% of the score) and plan each provider's
- * per-trial budget. This baseline takes the first provider, in the brief's order, whose listing answered
- * with a free model meeting the requirements, and that provider's first model by id.
- */
+/** Quality-ranked compatible routes used as the deterministic fallback pool and by the planner. */
 function routesFor(requires: Requirement): Route[] {
   const candidates: Array<Route & { rating: number; providerOrder: number }> = [];
   probes.forEach((probe, providerOrder) => {
@@ -165,6 +167,39 @@ function routesFor(requires: Requirement): Route[] {
 
 function routeFor(requires: Requirement): Route | null {
   return routesFor(requires)[0] ?? null;
+}
+
+/**
+ * Allocate the manifest's first attempts before serving starts. The brief does not publish failure
+ * schedules, so this deliberately uses only the manifest, capabilities and ratings: a provider that
+ * is only a few rating points better is not worth spending every request on the same quota.
+ */
+function planRoutes(): void {
+  plannedRoutes = [];
+  const plannedUses = new Map<string, number>();
+  const manifest = brief.workload?.manifest ?? [];
+  for (const request of manifest) {
+    const candidates = routesFor(request.requires);
+    if (candidates.length === 0) {
+      plannedRoutes.push(null);
+      continue;
+    }
+    const ranked = candidates.map((route, candidateIndex) => {
+      const providerId = route.probe.provider.id;
+      const uses = plannedUses.get(providerId) ?? 0;
+      const row = ratingOfModel(brief.ratings, providerId, route.model.id);
+      return {
+        route,
+        score: (row?.rating_milli ?? 0) - PLAN_LOAD_PENALTY * uses,
+        candidateIndex,
+      };
+    });
+    ranked.sort((a, b) => b.score - a.score || a.candidateIndex - b.candidateIndex || byId(a.route.model, b.route.model));
+    const primary = ranked[0].route;
+    plannedRoutes.push(primary);
+    const providerId = primary.probe.provider.id;
+    plannedUses.set(providerId, (plannedUses.get(providerId) ?? 0) + 1);
+  }
 }
 
 function providerIsExhausted(text: string): boolean {
@@ -189,15 +224,24 @@ function allRoutesFor(requires: Requirement): Route[] {
   return all;
 }
 
+/** Put the preplanned first attempt ahead of the quality-ranked fallbacks for this request. */
+function routesForRequest(requires: Requirement, requestIndex: number): Route[] {
+  const routes = allRoutesFor(requires);
+  const primary = plannedRoutes[requestIndex] ?? null;
+  if (primary === null || !routes.some((route) => routeKey(route) === routeKey(primary))) return routes;
+  return [primary, ...routes.filter((route) => routeKey(route) !== routeKey(primary))];
+}
+
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requirementsFor(body: Json): Requirement {
+function requirementsFor(body: Json): { requires: Requirement; requestIndex: number } {
   const manifest = brief.workload?.manifest ?? [];
-  const entry = manifest[manifestIndex];
+  const requestIndex = manifestIndex;
+  const entry = manifest[requestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return entry.requires;
+  if (entry !== undefined) return { requires: entry.requires, requestIndex };
   // TODO(workload): the manifest is the declared source of each request's requirements; this fallback is a
   // guess for a brief that holds none.
-  return requirementsFromBody(body);
+  return { requires: requirementsFromBody(body), requestIndex };
 }
 
 /** Requirements read off a request body, when the manifest has no row for it. */
@@ -294,14 +338,17 @@ async function rewrittenAnswer(upstream: Response, route: Route, clientWire: 'op
 async function attemptRoutes(routes: readonly Route[], body: Json, clientWire: 'openai' | 'anthropic', clientModel: string, res: ServerResponse): Promise<void> {
   let lastStatus = 503;
   let lastText = 'no compatible provider answered';
+  const failedProviders = new Set<string>();
   for (const route of routes) {
-    if (retiredProviders.has(route.probe.provider.id)) continue;
+    const providerId = route.probe.provider.id;
+    if (retiredProviders.has(providerId) || failedProviders.has(providerId)) continue;
     let upstream: Response;
     try {
       upstream = await callProvider(route, body, clientWire);
     } catch (err) {
       lastStatus = 502;
       lastText = (err as Error).message;
+      failedProviders.add(providerId);
       continue;
     }
     if (!upstream.ok) {
@@ -311,6 +358,7 @@ async function attemptRoutes(routes: readonly Route[], body: Json, clientWire: '
         sendError(res, clientWire, upstream.status, clientWire === 'anthropic' ? 'api_error' : 'upstream_error', `provider ${route.probe.provider.id} answered HTTP ${upstream.status}`);
         return;
       }
+      failedProviders.add(providerId);
       retireFromFailure(route, lastText);
       continue;
     }
@@ -322,6 +370,7 @@ async function attemptRoutes(routes: readonly Route[], body: Json, clientWire: '
     } catch (err) {
       lastStatus = 502;
       lastText = (err as Error).message;
+      failedProviders.add(providerId);
     }
   }
   sendError(res, clientWire, retryable(lastStatus) ? 503 : lastStatus, clientWire === 'anthropic' ? 'overloaded_error' : 'service_unavailable', `all compatible providers failed: ${lastText.slice(0, 300)}`);
@@ -331,7 +380,8 @@ async function attemptRoutes(routes: readonly Route[], body: Json, clientWire: '
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const routes = allRoutesFor(requirementsFor(body));
+  const routing = requirementsFor(body);
+  const routes = routesForRequest(routing.requires, routing.requestIndex);
   if (routes.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model on the directory meets this request');
   await attemptRoutes(routes, body, 'openai', typeof body.model === 'string' && body.model !== '' ? body.model : routes[0].model.id, res);
 }
@@ -340,7 +390,8 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const routes = allRoutesFor(requirementsFor(body));
+  const routing = requirementsFor(body);
+  const routes = routesForRequest(routing.requires, routing.requestIndex);
   if (routes.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model on the directory meets this request');
   await attemptRoutes(routes, body, 'anthropic', typeof body.model === 'string' && body.model !== '' ? body.model : routes[0].model.id, res);
 }
